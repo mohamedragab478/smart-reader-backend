@@ -326,10 +326,18 @@ def web_search(q: str, max_results: int = 8):
         
         # Wikipedia Search API
         url = f"https://{lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q)}&utf8=&format=json&srlimit={max_results}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'SmartReader/1.0'})
+        headers = {
+            'User-Agent': 'SmartReaderBot/1.0 (https://github.com/mohamedragab478/smart-reader-backend; bot@example.com)'
+        }
+        req = urllib.request.Request(url, headers=headers)
         
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode('utf-8'))
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                raise HTTPException(status_code=429, detail="عذراً، ويكيبيديا تمنع كثرة الطلبات حالياً. يرجى المحاولة بعد قليل.")
+            raise e
             
         results = []
         for item in data.get('query', {}).get('search', []):
