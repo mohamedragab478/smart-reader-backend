@@ -352,6 +352,5 @@ def web_search(q: str, max_results: int = 8):
         return results
     except Exception as e:
         import traceback
-        with open("error.log", "w", encoding="utf-8") as f:
-            f.write(traceback.format_exc())
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء البحث: {str(e)}")
