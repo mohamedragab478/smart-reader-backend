@@ -5,15 +5,36 @@ from typing import List, Optional
 class UserBase(BaseModel):
     id: int
     name: str
+    email: Optional[str] = None
 
     class Config:
         from_attributes = True
 
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    code: str
+
+class EmailVerificationRequest(BaseModel):
+    email: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserBase
+
+class TokenData(BaseModel):
+    email: Optional[str] = None
+
 # --- Comment Schemas ---
 class CommentCreate(BaseModel):
     text: str
-    user: Optional[UserBase] = None
-    article: Optional[BaseModel] = None  # We will handle nested article ID parsing in main
+    article_id: int
 
     class Config:
         from_attributes = True
@@ -23,9 +44,15 @@ class CommentResponse(BaseModel):
     text: str
     sentiment: str
     user: Optional[UserBase] = None
+    upvotes: int = 0
+    downvotes: int = 0
+    score: int = 0
 
     class Config:
         from_attributes = True
+
+class CommentRatingCreate(BaseModel):
+    vote: int  # 1 or -1
 
 # --- Article Schemas ---
 class ArticleBase(BaseModel):

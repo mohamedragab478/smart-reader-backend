@@ -14,6 +14,12 @@ from app.db.database import engine, get_db
 from app.models import models
 from app.schemas import schemas
 from app.services.scraper import scrape_article_url
+from app.security import get_password_hash, verify_password, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES
+from datetime import timedelta, datetime
+import random
+import smtplib
+from email.mime.text import MIMEText
+from fastapi.security import OAuth2PasswordRequestForm
 
 # Load environment variables from .env file
 load_dotenv()
@@ -118,6 +124,100 @@ def generate_ai_summary(content: str) -> str:
         return fallback_summary + "."
     return content[:150] + "..."
 
+# --- Auth Endpoints ---
+
+def send_verification_email(to_email: str, code: str):
+    # For development, just print the code.
+    print(f"\n{'='*40}")
+    print(f"VERIFICATION CODE FOR {to_email}: {code}")
+    print(f"{'='*40}\n")
+    
+    # Real email sending logic (needs valid SMTP credentials in .env)
+    sender_email = os.environ.get("SMTP_EMAIL")
+    sender_password = os.environ.get("SMTP_PASSWORD")
+    
+    if sender_email and sender_password:
+        try:
+            msg = MIMEText(f"كود التفعيل الخاص بك هو: {code}\n\nهذا الكود صالح لمدة 10 دقائق فقط.")
+            msg['Subject'] = 'كود تفعيل حسابك - Smart Reader'
+            msg['From'] = sender_email
+            msg['To'] = to_email
+
+            server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+            server.quit()
+        except Exception as e:
+            print(f"Error sending email: {e}")
+
+@app.post("/api/v1/auth/request-verification")
+def request_verification(req: schemas.EmailVerificationRequest, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == req.email).first()
+    if user:
+        raise HTTPException(status_code=400, detail="البريد الإلكتروني مسجل مسبقاً")
+        
+    code = str(random.randint(100000, 999999))
+    expires_at = datetime.utcnow() + timedelta(minutes=10)
+    
+    # Delete old codes for this email
+    db.query(models.EmailVerificationCode).filter(models.EmailVerificationCode.email == req.email).delete()
+    
+    db_code = models.EmailVerificationCode(email=req.email, code=code, expires_at=expires_at)
+    db.add(db_code)
+    db.commit()
+    
+    send_verification_email(req.email, code)
+    return {"message": "تم إرسال كود التفعيل بنجاح"}
+
+@app.post("/api/v1/auth/register", response_model=schemas.Token)
+def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == user_in.email).first()
+    if user:
+        raise HTTPException(status_code=400, detail="البريد الإلكتروني مسجل مسبقاً")
+        
+    # Verify code
+    db_code = db.query(models.EmailVerificationCode).filter(
+        models.EmailVerificationCode.email == user_in.email,
+        models.EmailVerificationCode.code == user_in.code
+    ).first()
+    
+    if not db_code:
+        raise HTTPException(status_code=400, detail="كود التفعيل غير صحيح")
+        
+    if db_code.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="انتهت صلاحية كود التفعيل")
+    
+    hashed_password = get_password_hash(user_in.password)
+    new_user = models.User(name=user_in.name, email=user_in.email, hashed_password=hashed_password)
+    db.add(new_user)
+    
+    # Delete the code so it cannot be used again
+    db.delete(db_code)
+    db.commit()
+    db.refresh(new_user)
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": new_user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer", "user": new_user}
+
+@app.post("/api/v1/auth/login", response_model=schemas.Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="البريد الإلكتروني أو كلمة المرور غير صحيحة",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer", "user": user}
+
 # --- Endpoints ---
 
 @app.get("/api/v1/articles", response_model=List[schemas.ArticleResponse])
@@ -136,23 +236,8 @@ def get_article_summary(article_id: int, db: Session = Depends(get_db)):
     return summary
 
 @app.post("/api/v1/comments", response_model=schemas.CommentResponse)
-def create_comment(comment_in: schemas.CommentCreate, db: Session = Depends(get_db)):
-    user_id = comment_in.user.id if comment_in.user else 1
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
-        user = models.User(id=user_id, name="مستخدم جديد")
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-    article_id = None
-    if comment_in.article and hasattr(comment_in.article, 'id'):
-        article_id = comment_in.article.id
-    
-    if not article_id:
-        raise HTTPException(status_code=400, detail="يجب تحديد المقال المرتبط بالتعليق")
-
-    article = db.query(models.Article).filter(models.Article.id == article_id).first()
+def create_comment(comment_in: schemas.CommentCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    article = db.query(models.Article).filter(models.Article.id == comment_in.article_id).first()
     if not article:
         raise HTTPException(status_code=404, detail="المقال غير موجود")
 
@@ -161,7 +246,7 @@ def create_comment(comment_in: schemas.CommentCreate, db: Session = Depends(get_
     db_comment = models.Comment(
         text=comment_in.text,
         sentiment=sentiment,
-        user_id=user.id,
+        user_id=current_user.id,
         article_id=article.id
     )
     db.add(db_comment)
@@ -169,6 +254,43 @@ def create_comment(comment_in: schemas.CommentCreate, db: Session = Depends(get_
     db.refresh(db_comment)
     
     return db_comment
+
+
+@app.post("/api/v1/comments/{comment_id}/rate", response_model=schemas.CommentResponse)
+def rate_comment(comment_id: int, rating_in: schemas.CommentRatingCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    comment = db.query(models.Comment).filter(models.Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="التعليق غير موجود")
+        
+    if rating_in.vote not in [1, -1]:
+        raise HTTPException(status_code=400, detail="تقييم غير صالح. يجب أن يكون 1 أو -1")
+
+    # Check if user already rated this comment
+    existing_rating = db.query(models.CommentRating).filter(
+        models.CommentRating.comment_id == comment_id,
+        models.CommentRating.user_id == current_user.id
+    ).first()
+    
+    if existing_rating:
+        if existing_rating.vote == rating_in.vote:
+            # User wants to remove their vote
+            db.delete(existing_rating)
+        else:
+            # User wants to change their vote
+            existing_rating.vote = rating_in.vote
+    else:
+        # Create new rating
+        new_rating = models.CommentRating(
+            vote=rating_in.vote,
+            user_id=current_user.id,
+            comment_id=comment_id
+        )
+        db.add(new_rating)
+        
+    db.commit()
+    db.refresh(comment)
+    return comment
+
 
 # --- 🚀 Upgraded Scraping Endpoint ---
 @app.post("/api/v1/articles/scrape", response_model=schemas.ArticleResponse)
