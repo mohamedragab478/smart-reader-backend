@@ -63,6 +63,8 @@ class ArticleBase(BaseModel):
     author: Optional[str] = None
     image: Optional[str] = None
     summary: Optional[str] = None
+    is_sensitive: Optional[bool] = False
+    user_id: Optional[int] = None
 
     class Config:
         from_attributes = True

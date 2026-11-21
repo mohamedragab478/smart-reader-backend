@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean
 from sqlalchemy.orm import relationship
 from app.db.database import Base
 from datetime import datetime
@@ -11,6 +11,7 @@ class User(Base):
     email = Column(String(100), unique=True, index=True, nullable=True)
     hashed_password = Column(String(255), nullable=True)
 
+    articles = relationship("Article", back_populates="user")
     comments = relationship("Comment", back_populates="user")
     ratings = relationship("CommentRating", back_populates="user")
     searches = relationship("SearchHistory", back_populates="user", cascade="all, delete-orphan")
@@ -27,7 +28,10 @@ class Article(Base):
     author = Column(String(100))
     image = Column(String(500))
     summary = Column(Text, nullable=True)
+    is_sensitive = Column(Boolean, default=False, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
+    user = relationship("User", back_populates="articles")
     comments = relationship("Comment", back_populates="article", cascade="all, delete-orphan")
 
 class Comment(Base):

@@ -14,7 +14,7 @@ from app.db.database import engine, get_db
 from app.models import models
 from app.schemas import schemas
 from app.services.scraper import scrape_article_url
-from app.security import get_password_hash, verify_password, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES
+from app.security import get_password_hash, verify_password, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES, get_optional_current_user
 from datetime import timedelta, datetime
 import random
 import requests
@@ -26,6 +26,22 @@ load_dotenv()
 
 # Initialize database tables
 models.Base.metadata.create_all(bind=engine)
+
+# Auto-migrate is_sensitive and user_id columns on articles table
+try:
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        for col_sql in [
+            "ALTER TABLE articles ADD COLUMN is_sensitive BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE articles ADD COLUMN user_id INTEGER"
+        ]:
+            try:
+                conn.execute(text(col_sql))
+                conn.commit()
+            except Exception:
+                pass
+except Exception:
+    pass
 
 app = FastAPI(title="Smart Reader API", version="1.0.0")
 
@@ -43,6 +59,60 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Sensitive Content Moderation Helper ---
+def check_sensitive_content(text: str) -> bool:
+    """
+    Checks if text contains adult, sexual, graphic violence, or murder/blood content.
+    Returns True if sensitive, False otherwise.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    sensitive_keywords = [
+        # Sexual / Adult (Arabic)
+        "جنسي", "جنسية", "اباحي", "إباحي", "إباحية", "اباحية", "شهوة", "علاقة جنسية", 
+        "ممارسة الجنس", "ثدي", "عورة", "مهبل", "قضيب", "جماع", "اغتصاب", "متحرش", "تحرش", 
+        "محتوى جنسي", "عري", "سكس", "نيك", "شرموطة", "شاذ", "لواط", "دعارة", "مومس",
+        # Violence / Gore / Blood / Murder (Arabic)
+        "قتل", "جريمة قتل", "مجزرة", "مذبحة", "جثة", "جثث", "دماء", "دموي", "دموية", 
+        "نحر", "قطع رأس", "تعذيب", "اشلاء", "أشلاء", "انتحار", "شنق", "سفك الدماء",
+        # English Adult / NSFW
+        "porn", "pornography", "nude", "nudity", "erotic", "nsfw", "xxx", "sex", "sexual",
+        "intercourse", "vagina", "penis", "rape", "molest", "prostitution",
+        # English Violence / Gore
+        "murder", "slaughter", "massacre", "corpse", "bloodshed", "bloody", "decapitat",
+        "torture", "suicide", "severed", "mutilat", "gore"
+    ]
+    for kw in sensitive_keywords:
+        if kw in t:
+            return True
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if api_key and api_key.strip() and len(text) > 100:
+        try:
+            from groq import Groq
+            client = Groq(api_key=api_key)
+            prompt = (
+                "Analyze the following text and determine if it contains explicit adult/sexual content (NSFW), "
+                "graphic gore, bloodshed, torture, or murder.\n"
+                "Answer ONLY with 'YES' if it contains sensitive/inappropriate content, or 'NO' if it is safe.\n\n"
+                f"Text sample:\n{text[:1500]}"
+            )
+            groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+            resp = client.chat.completions.create(
+                model=groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=5,
+            )
+            decision = resp.choices[0].message.content.strip().upper()
+            if "YES" in decision:
+                return True
+        except Exception:
+            pass
+
+    return False
+
 
 # --- Sentiment Analysis Helper ---
 def analyze_sentiment(text: str) -> str:
@@ -246,8 +316,18 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 # --- Endpoints ---
 
 @app.get("/api/v1/articles", response_model=List[schemas.ArticleResponse])
-def get_articles(db: Session = Depends(get_db)):
-    articles = db.query(models.Article).order_by(models.Article.id.desc()).all()
+def get_articles(db: Session = Depends(get_db), current_user: Optional[models.User] = Depends(get_optional_current_user)):
+    if current_user:
+        # المستخدم المسجل يرى: المقالات العامة + مقالاته الخاصة الحساسة
+        articles = db.query(models.Article).filter(
+            (models.Article.is_sensitive == False) |
+            (models.Article.user_id == current_user.id)
+        ).order_by(models.Article.id.desc()).all()
+    else:
+        # الزائر يرى فقط المقالات الآمنة
+        articles = db.query(models.Article).filter(
+            models.Article.is_sensitive == False
+        ).order_by(models.Article.id.desc()).all()
     return articles
 
 @app.get("/api/v1/ai/articles/{article_id}/summary")
@@ -335,13 +415,16 @@ def delete_comment(comment_id: int, db: Session = Depends(get_db), current_user:
 
 # --- 🚀 Upgraded Scraping Endpoint ---
 @app.post("/api/v1/articles/scrape", response_model=schemas.ArticleResponse)
-def scrape_and_add_article(req: schemas.ScrapeRequest, db: Session = Depends(get_db)):
+def scrape_and_add_article(req: schemas.ScrapeRequest, db: Session = Depends(get_db), current_user: Optional[models.User] = Depends(get_optional_current_user)):
     scraped_data = scrape_article_url(req.url)
     
     # Auto-generate next ID
     max_id_article = db.query(models.Article).order_by(models.Article.id.desc()).first()
     next_id = (max_id_article.id + 1) if max_id_article else 1
-    
+
+    # Content moderation check
+    is_sensitive = check_sensitive_content(scraped_data["title"] + " " + scraped_data["content"])
+
     db_article = models.Article(
         id=next_id,
         title=scraped_data["title"],
@@ -349,7 +432,9 @@ def scrape_and_add_article(req: schemas.ScrapeRequest, db: Session = Depends(get
         category=scraped_data["category"],
         author=scraped_data["author"],
         image=scraped_data["image"],
-        summary=""  # Generate on demand
+        summary="",  # Generate on demand
+        is_sensitive=is_sensitive,
+        user_id=current_user.id if current_user else None
     )
     
     db.add(db_article)
@@ -364,7 +449,7 @@ import docx
 from PyPDF2 import PdfReader
 
 @app.post("/api/v1/articles/upload", response_model=schemas.ArticleResponse)
-async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: Optional[models.User] = Depends(get_optional_current_user)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="الملف غير صالح")
         
@@ -397,6 +482,9 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
         max_id_article = db.query(models.Article).order_by(models.Article.id.desc()).first()
         next_id = (max_id_article.id + 1) if max_id_article else 1
         
+        # Content moderation check
+        is_sensitive = check_sensitive_content(title + " " + content_text)
+
         db_article = models.Article(
             id=next_id,
             title=title,
@@ -404,7 +492,9 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
             category="مستند مرفوع",
             author="أنت",
             image=None,
-            summary=""
+            summary="",
+            is_sensitive=is_sensitive,
+            user_id=current_user.id if current_user else None
         )
         db.add(db_article)
         db.commit()
