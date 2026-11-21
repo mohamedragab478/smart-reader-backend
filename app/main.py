@@ -40,6 +40,14 @@ try:
                 conn.commit()
             except Exception:
                 pass
+
+        # Retroactively mark any old articles that contain sensitive terms
+        for word in ["%إباح%", "%اباح%", "%جنس%", "%سكس%", "%قتل%"]:
+            try:
+                conn.execute(text("UPDATE articles SET is_sensitive = TRUE WHERE title LIKE :w OR content LIKE :w"), {"w": word})
+                conn.commit()
+            except Exception:
+                pass
 except Exception:
     pass
 
