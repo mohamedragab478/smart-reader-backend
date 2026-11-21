@@ -30,26 +30,25 @@ models.Base.metadata.create_all(bind=engine)
 # Auto-migrate is_sensitive and user_id columns on articles table
 try:
     from sqlalchemy import text
-    with engine.connect() as conn:
-        for col_sql in [
-            "ALTER TABLE articles ADD COLUMN is_sensitive BOOLEAN DEFAULT FALSE",
-            "ALTER TABLE articles ADD COLUMN user_id INTEGER"
-        ]:
-            try:
+    for col_sql in [
+        "ALTER TABLE articles ADD COLUMN is_sensitive BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE articles ADD COLUMN user_id INTEGER"
+    ]:
+        try:
+            with engine.begin() as conn:
                 conn.execute(text(col_sql))
-                conn.commit()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        # Retroactively mark any old articles that contain sensitive terms
-        for word in ["%إباح%", "%اباح%", "%جنس%", "%سكس%", "%قتل%"]:
-            try:
-                conn.execute(text("UPDATE articles SET is_sensitive = TRUE WHERE title LIKE :w OR content LIKE :w"), {"w": word})
-                conn.commit()
-            except Exception:
-                pass
-except Exception:
-    pass
+    # Retroactively mark any old articles that contain sensitive terms
+    for word in ["%إباح%", "%اباح%", "%جنس%", "%سكس%", "%قتل%", "%porn%", "%sex%"]:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE articles SET is_sensitive = TRUE WHERE LOWER(title) LIKE :w OR LOWER(content) LIKE :w"), {"w": word})
+        except Exception as e:
+            print(f"[Retroactive Filter Error] {e}")
+except Exception as e:
+    print(f"[Migration Error] {e}")
 
 app = FastAPI(title="Smart Reader API", version="1.0.0")
 
