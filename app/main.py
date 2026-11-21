@@ -3,7 +3,7 @@ import sys
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 # Force UTF-8 encoding for standard output to prevent Uvicorn from crashing when logging Arabic URLs on Windows
