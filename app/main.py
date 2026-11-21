@@ -17,8 +17,8 @@ from app.services.scraper import scrape_article_url
 from app.security import get_password_hash, verify_password, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES
 from datetime import timedelta, datetime
 import random
-import smtplib
-from email.mime.text import MIMEText
+import requests
+import traceback
 from fastapi.security import OAuth2PasswordRequestForm
 
 # Load environment variables from .env file
@@ -82,8 +82,9 @@ def generate_ai_summary(content: str) -> str:
         try:
             from groq import Groq
             client = Groq(api_key=api_key)
+            groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=groq_model,
                 messages=[
                     {"role": "system", "content": "You are a professional summarizer. You MUST output ONLY the raw summary text. No intro, no outro, no conversational filler. Summarize the text in the exact same language as the input text."},
                     {"role": "user", "content": f"Summarize this text in 2-3 sentences. Start immediately with the first word of the summary:\n\n{content[:4000]}"}
@@ -126,29 +127,53 @@ def generate_ai_summary(content: str) -> str:
 
 # --- Auth Endpoints ---
 
-def send_verification_email(to_email: str, code: str):
+def send_verification_email(to_email: str, code: str) -> bool:
     # For development, just print the code.
     print(f"\n{'='*40}")
     print(f"VERIFICATION CODE FOR {to_email}: {code}")
     print(f"{'='*40}\n")
     
-    # Real email sending logic (needs valid SMTP credentials in .env)
-    sender_email = os.environ.get("SMTP_EMAIL")
-    sender_password = os.environ.get("SMTP_PASSWORD")
-    
-    if sender_email and sender_password:
-        try:
-            msg = MIMEText(f"كود التفعيل الخاص بك هو: {code}\n\nهذا الكود صالح لمدة 10 دقائق فقط.")
-            msg['Subject'] = 'كود تفعيل حسابك - Smart Reader'
-            msg['From'] = sender_email
-            msg['To'] = to_email
+    api_key = os.environ.get("BREVO_API_KEY")
+    if not api_key:
+        print("[Brevo Email Error]: BREVO_API_KEY environment variable is not set.")
+        return False
 
-            server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-            server.quit()
-        except Exception as e:
-            print(f"Error sending email: {e}")
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "api-key": api_key,
+        "content-type": "application/json"
+    }
+    payload = {
+        "sender": {
+            "name": "Smart Reader",
+            "email": "smartreadercommunity1@gmail.com"
+        },
+        "to": [
+            {
+                "email": to_email
+            }
+        ],
+        "subject": "كود تفعيل حسابك - Smart Reader",
+        "htmlContent": f"<div dir='rtl' style='font-family: Arial, sans-serif; padding: 25px; background-color: #f4f4f7;'><div style='max-width: 500px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); text-align: center;'><h2 style='color: #4f46e5; margin-bottom: 10px;'>Smart Reader</h2><p style='color: #4b5563; font-size: 16px;'>كود التفعيل الخاص بحسابك هو:</p><div style='background: #eef2ff; border: 2px dashed #6366f1; border-radius: 12px; padding: 15px; margin: 20px 0;'><span style='color: #4338ca; font-size: 32px; font-weight: bold; letter-spacing: 6px;'>{code}</span></div><p style='color: #9ca3af; font-size: 14px;'>هذا الكود صالح لمدة 10 دقائق فقط.</p></div></div>"
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        if response.status_code in (200, 201, 202):
+            print(f"[Brevo Email Success] Status Code: {response.status_code}")
+            print(f"[Brevo Email Response Body]: {response.text}")
+            return True
+        else:
+            print(f"[Brevo Email Failure] Status Code: {response.status_code}")
+            print(f"[Brevo Email Response Body]: {response.text}")
+            print(f"[Brevo Email Response Headers]: {dict(response.headers)}")
+            print(f"[Brevo Email Exception Traceback]: None (HTTP Status {response.status_code})")
+            return False
+    except Exception as e:
+        print(f"[Brevo Email Exception Failure]: {e}")
+        print(f"[Brevo Email Exception Traceback]:\n{traceback.format_exc()}")
+        return False
 
 @app.post("/api/v1/auth/request-verification")
 def request_verification(req: schemas.EmailVerificationRequest, db: Session = Depends(get_db)):
@@ -222,7 +247,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 @app.get("/api/v1/articles", response_model=List[schemas.ArticleResponse])
 def get_articles(db: Session = Depends(get_db)):
-    articles = db.query(models.Article).all()
+    articles = db.query(models.Article).order_by(models.Article.id.desc()).all()
     return articles
 
 @app.get("/api/v1/ai/articles/{article_id}/summary")
@@ -290,6 +315,22 @@ def rate_comment(comment_id: int, rating_in: schemas.CommentRatingCreate, db: Se
     db.commit()
     db.refresh(comment)
     return comment
+
+
+@app.delete("/api/v1/comments/{comment_id}")
+def delete_comment(comment_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    comment = db.query(models.Comment).filter(models.Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="التعليق غير موجود")
+        
+    if comment.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="غير مصرح لك بحذف هذا التعليق")
+        
+    # Delete associated ratings
+    db.query(models.CommentRating).filter(models.CommentRating.comment_id == comment_id).delete()
+    db.delete(comment)
+    db.commit()
+    return {"message": "تم حذف التعليق بنجاح", "id": comment_id}
 
 
 # --- 🚀 Upgraded Scraping Endpoint ---
@@ -375,6 +416,8 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء معالجة الملف: {str(e)}")
 
+from fastapi.responses import StreamingResponse
+
 # --- 🚀 Upgraded Chatbot (RAG) Endpoint ---
 @app.post("/api/v1/ai/articles/{article_id}/chat")
 def chat_with_article(article_id: int, chat_req: schemas.ChatRequest, db: Session = Depends(get_db)):
@@ -384,16 +427,16 @@ def chat_with_article(article_id: int, chat_req: schemas.ChatRequest, db: Sessio
         
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key or not api_key.strip():
-        # Fallback offline replies
         user_msg = chat_req.message.lower()
         if any(greeting in user_msg for greeting in ["مرحباً", "hello", "hi", "سلام", "هلا"]):
-            return {"reply": "أهلاً بك! أنا مساعدك الذكي لقراءة وتلخيص هذا المقال. كيف يمكنني مساعدتك اليوم؟"}
-        
-        if any(kw in user_msg for kw in ["لخص", "ملخص", "summary", "summarize"]):
+            reply_text = "أهلاً بك! أنا مساعدك الذكي لقراءة وتلخيص هذا المقال. كيف يمكنني مساعدتك اليوم؟"
+        elif any(kw in user_msg for kw in ["لخص", "ملخص", "summary", "summarize"]):
             summary_text = article.summary if article.summary else generate_ai_summary(article.content)
-            return {"reply": f"إليك ملخص سريع للمقال:\n{summary_text}"}
-            
-        return {"reply": f"أهلاً بك! لم يتم ضبط مفتاح Groq API Key في ملف `.env` بعد. يمكنك الحصول عليه مجاناً من https://console.groq.com"}
+            reply_text = f"إليك ملخص سريع للمقال:\n{summary_text}"
+        else:
+            reply_text = "أهلاً بك! لم يتم ضبط مفتاح Groq API Key في ملف `.env` بعد. يمكنك الحصول عليه مجاناً من https://console.groq.com"
+        
+        return {"reply": reply_text}
         
     try:
         from groq import Groq
@@ -410,20 +453,24 @@ def chat_with_article(article_id: int, chat_req: schemas.ChatRequest, db: Sessio
 المحتوى:
 {article.content[:4000]}"""
         
-        # Build messages from history
+        # Build messages safely (filtering out empty messages)
         messages = [{"role": "system", "content": system_prompt}]
         if chat_req.history:
             for h in chat_req.history:
-                role = "user" if h.role == "user" else "assistant"
-                messages.append({"role": role, "content": h.content})
-        messages.append({"role": "user", "content": chat_req.message})
+                if h.content and h.content.strip():
+                    role = "user" if h.role == "user" else "assistant"
+                    messages.append({"role": role, "content": h.content.strip()})
+        messages.append({"role": "user", "content": chat_req.message.strip()})
         
+        groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=groq_model,
             messages=messages,
             max_tokens=1024,
         )
-        return {"reply": response.choices[0].message.content.strip()}
+        reply_text = response.choices[0].message.content.strip()
+        return {"reply": reply_text}
+
     except Exception as e:
         print(f"Groq Chat error: {e}")
         return {"reply": f"حدث خطأ أثناء الاتصال بالذكاء الاصطناعي: {str(e)}"}
