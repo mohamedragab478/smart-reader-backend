@@ -531,3 +531,40 @@ def web_search(q: str, max_results: int = 8):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"حدث خطأ أثناء البحث: {str(e)}")
+
+# --- 🎙️ Text-to-Speech (Neural TTS) Endpoint ---
+@app.post("/api/v1/tts")
+async def text_to_speech(req: schemas.TTSRequest):
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="النص مطلوب")
+    
+    voice_map = {
+        "salma": "ar-EG-SalmaNeural",
+        "shakir": "ar-SA-HamedNeural",
+        "hamed": "ar-SA-HamedNeural",
+        "ar-eg-salmaneural": "ar-EG-SalmaNeural",
+        "ar-sa-hamedneural": "ar-SA-HamedNeural",
+    }
+    selected_voice = voice_map.get(req.voice.lower() if req.voice else "", "ar-EG-SalmaNeural")
+    
+    try:
+        import edge_tts
+        from fastapi.responses import StreamingResponse
+        
+        clean_text = req.text.strip()[:10000]
+        communicate = edge_tts.Communicate(clean_text, selected_voice)
+        
+        async def audio_stream():
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    yield chunk["data"]
+                    
+        return StreamingResponse(
+            audio_stream(),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": 'inline; filename="speech.mp3"'}
+        )
+    except Exception as e:
+        print(f"TTS Generation Error: {e}")
+        raise HTTPException(status_code=500, detail=f"فشل توليد الصوت: {str(e)}")
+

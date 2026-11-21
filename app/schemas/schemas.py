@@ -92,3 +92,8 @@ class SearchResult(BaseModel):
     snippet: Optional[str] = None
     image: Optional[str] = None
     source: Optional[str] = None
+
+# --- Text-to-Speech Schema ---
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = "salma"
