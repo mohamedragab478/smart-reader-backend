@@ -77,6 +77,7 @@ class EmailVerificationCode(Base):
     email = Column(String(100), index=True, nullable=False)
     code = Column(String(10), nullable=False)
     expires_at = Column(DateTime, nullable=False)
+    failed_attempts = Column(Integer, default=0, nullable=False)
 
 class SearchHistory(Base):
     __tablename__ = "search_history"

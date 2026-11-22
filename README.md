@@ -21,7 +21,7 @@ DATABASE_URL=sqlite:///./smart_reader.db
    ```
 2. Run the application:
    ```bash
-   uvicorn main:app --reload --port 8080
+   uvicorn app.main:app --reload --port 8001
    ```
 
 ## Docker

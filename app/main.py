@@ -14,9 +14,10 @@ from app.db.database import engine, get_db
 from app.models import models
 from app.schemas import schemas
 from app.services.scraper import scrape_article_url
-from app.security import get_password_hash, verify_password, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES, get_optional_current_user
+from app.security import get_password_hash, verify_password, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES, get_optional_current_user, get_visible_article
 from datetime import timedelta, datetime
 import random
+import secrets
 import requests
 import traceback
 from fastapi.security import OAuth2PasswordRequestForm
@@ -32,7 +33,8 @@ try:
     from sqlalchemy import text
     for col_sql in [
         "ALTER TABLE articles ADD COLUMN is_sensitive BOOLEAN DEFAULT FALSE",
-        "ALTER TABLE articles ADD COLUMN user_id INTEGER"
+        "ALTER TABLE articles ADD COLUMN user_id INTEGER",
+        "ALTER TABLE email_verification_codes ADD COLUMN failed_attempts INTEGER DEFAULT 0"
     ]:
         try:
             with engine.begin() as conn:
@@ -205,10 +207,8 @@ def generate_ai_summary(content: str) -> str:
 # --- Auth Endpoints ---
 
 def send_verification_email(to_email: str, code: str) -> bool:
-    # For development, just print the code.
-    print(f"\n{'='*40}")
-    print(f"VERIFICATION CODE FOR {to_email}: {code}")
-    print(f"{'='*40}\n")
+    if os.environ.get("ENV") != "production":
+        print(f"\n{'='*40}\nVERIFICATION CODE FOR {to_email}: {code}\n{'='*40}\n")
     
     api_key = os.environ.get("BREVO_API_KEY")
     if not api_key:
@@ -239,58 +239,63 @@ def send_verification_email(to_email: str, code: str) -> bool:
         response = requests.post(url, json=payload, headers=headers, timeout=15)
         if response.status_code in (200, 201, 202):
             print(f"[Brevo Email Success] Status Code: {response.status_code}")
-            print(f"[Brevo Email Response Body]: {response.text}")
             return True
         else:
             print(f"[Brevo Email Failure] Status Code: {response.status_code}")
-            print(f"[Brevo Email Response Body]: {response.text}")
-            print(f"[Brevo Email Response Headers]: {dict(response.headers)}")
-            print(f"[Brevo Email Exception Traceback]: None (HTTP Status {response.status_code})")
             return False
     except Exception as e:
         print(f"[Brevo Email Exception Failure]: {e}")
-        print(f"[Brevo Email Exception Traceback]:\n{traceback.format_exc()}")
         return False
 
 @app.post("/api/v1/auth/request-verification")
 def request_verification(req: schemas.EmailVerificationRequest, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == req.email).first()
+    clean_email = req.email.strip().lower()
+    user = db.query(models.User).filter(models.User.email == clean_email).first()
     if user:
         raise HTTPException(status_code=400, detail="البريد الإلكتروني مسجل مسبقاً")
         
-    code = str(random.randint(100000, 999999))
+    code = f"{secrets.randbelow(900000) + 100000}"
     expires_at = datetime.utcnow() + timedelta(minutes=10)
     
     # Delete old codes for this email
-    db.query(models.EmailVerificationCode).filter(models.EmailVerificationCode.email == req.email).delete()
+    db.query(models.EmailVerificationCode).filter(models.EmailVerificationCode.email == clean_email).delete()
     
-    db_code = models.EmailVerificationCode(email=req.email, code=code, expires_at=expires_at)
+    db_code = models.EmailVerificationCode(email=clean_email, code=code, expires_at=expires_at, failed_attempts=0)
     db.add(db_code)
     db.commit()
     
-    send_verification_email(req.email, code)
+    send_verification_email(clean_email, code)
     return {"message": "تم إرسال كود التفعيل بنجاح"}
 
 @app.post("/api/v1/auth/register", response_model=schemas.Token)
 def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == user_in.email).first()
+    clean_email = user_in.email.strip().lower()
+    user = db.query(models.User).filter(models.User.email == clean_email).first()
     if user:
         raise HTTPException(status_code=400, detail="البريد الإلكتروني مسجل مسبقاً")
         
-    # Verify code
+    # Check verification code with failed attempts limit (max 5)
     db_code = db.query(models.EmailVerificationCode).filter(
-        models.EmailVerificationCode.email == user_in.email,
-        models.EmailVerificationCode.code == user_in.code
+        models.EmailVerificationCode.email == clean_email
     ).first()
     
-    if not db_code:
+    if not db_code or db_code.code != user_in.code.strip():
+        if db_code:
+            db_code.failed_attempts = (db_code.failed_attempts or 0) + 1
+            if db_code.failed_attempts >= 5:
+                db.delete(db_code)
+                db.commit()
+                raise HTTPException(status_code=400, detail="تم تجاوز الحد الأقصى للمحاولات الخاطئة (5 محاولات). تم إلغاء الكود، يرجى طلب كود جديد.")
+            db.commit()
         raise HTTPException(status_code=400, detail="كود التفعيل غير صحيح")
         
     if db_code.expires_at < datetime.utcnow():
+        db.delete(db_code)
+        db.commit()
         raise HTTPException(status_code=400, detail="انتهت صلاحية كود التفعيل")
     
     hashed_password = get_password_hash(user_in.password)
-    new_user = models.User(name=user_in.name, email=user_in.email, hashed_password=hashed_password)
+    new_user = models.User(name=user_in.name.strip(), email=clean_email, hashed_password=hashed_password)
     db.add(new_user)
     
     # Delete the code so it cannot be used again
@@ -306,7 +311,8 @@ def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/v1/auth/login", response_model=schemas.Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+    clean_email = form_data.username.strip().lower()
+    user = db.query(models.User).filter(models.User.email == clean_email).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=401,
@@ -338,20 +344,14 @@ def get_articles(db: Session = Depends(get_db), current_user: Optional[models.Us
     return articles
 
 @app.get("/api/v1/ai/articles/{article_id}/summary")
-def get_article_summary(article_id: int, db: Session = Depends(get_db)):
-    article = db.query(models.Article).filter(models.Article.id == article_id).first()
-    if not article:
-        raise HTTPException(status_code=404, detail="المقال غير موجود")
-    
-    # Generate live summary
+def get_article_summary(article_id: int, db: Session = Depends(get_db), current_user: Optional[models.User] = Depends(get_optional_current_user)):
+    article = get_visible_article(article_id, db, current_user)
     summary = generate_ai_summary(article.content)
     return summary
 
 @app.post("/api/v1/comments", response_model=schemas.CommentResponse)
 def create_comment(comment_in: schemas.CommentCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    article = db.query(models.Article).filter(models.Article.id == comment_in.article_id).first()
-    if not article:
-        raise HTTPException(status_code=404, detail="المقال غير موجود")
+    article = get_visible_article(comment_in.article_id, db, current_user)
 
     sentiment = analyze_sentiment(comment_in.text)
 
@@ -424,21 +424,18 @@ def delete_comment(comment_id: int, db: Session = Depends(get_db), current_user:
 @app.post("/api/v1/articles/scrape", response_model=schemas.ArticleResponse)
 def scrape_and_add_article(req: schemas.ScrapeRequest, db: Session = Depends(get_db), current_user: Optional[models.User] = Depends(get_optional_current_user)):
     scraped_data = scrape_article_url(req.url)
+    if scraped_data.get("category") == "خطأ":
+        raise HTTPException(status_code=400, detail=scraped_data.get("content", "فشل جلب المقال"))
     
-    # Auto-generate next ID
-    max_id_article = db.query(models.Article).order_by(models.Article.id.desc()).first()
-    next_id = (max_id_article.id + 1) if max_id_article else 1
-
     # Content moderation check
     is_sensitive = check_sensitive_content(scraped_data["title"] + " " + scraped_data["content"])
 
     db_article = models.Article(
-        id=next_id,
-        title=scraped_data["title"],
+        title=scraped_data["title"][:255],
         content=scraped_data["content"],
-        category=scraped_data["category"],
-        author=scraped_data["author"],
-        image=scraped_data["image"],
+        category=scraped_data["category"][:100],
+        author=scraped_data["author"][:100],
+        image=(scraped_data["image"] or "")[:500],
         summary="",  # Generate on demand
         is_sensitive=is_sensitive,
         user_id=current_user.id if current_user else None
@@ -466,7 +463,9 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
     
     try:
         file_bytes = await file.read()
-        
+        if len(file_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="حجم الملف يتجاوز الحد الأقصى المسموح به (10 ميجابايت)")
+
         if ext == "txt":
             content_text = file_bytes.decode('utf-8', errors='ignore')
         elif ext == "pdf":
@@ -485,16 +484,11 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
         if not content_text.strip():
             raise HTTPException(status_code=400, detail="لم نتمكن من قراءة أي نص من الملف")
             
-        # Add to database as article
-        max_id_article = db.query(models.Article).order_by(models.Article.id.desc()).first()
-        next_id = (max_id_article.id + 1) if max_id_article else 1
-        
         # Content moderation check
         is_sensitive = check_sensitive_content(title + " " + content_text)
 
         db_article = models.Article(
-            id=next_id,
-            title=title,
+            title=title[:255],
             content=content_text.strip(),
             category="مستند مرفوع",
             author="أنت",
@@ -517,10 +511,8 @@ from fastapi.responses import StreamingResponse
 
 # --- 🚀 Upgraded Chatbot (RAG) Endpoint ---
 @app.post("/api/v1/ai/articles/{article_id}/chat")
-def chat_with_article(article_id: int, chat_req: schemas.ChatRequest, db: Session = Depends(get_db)):
-    article = db.query(models.Article).filter(models.Article.id == article_id).first()
-    if not article:
-        raise HTTPException(status_code=404, detail="المقال غير موجود")
+def chat_with_article(article_id: int, chat_req: schemas.ChatRequest, db: Session = Depends(get_db), current_user: Optional[models.User] = Depends(get_optional_current_user)):
+    article = get_visible_article(article_id, db, current_user)
         
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key or not api_key.strip():

@@ -6,6 +6,10 @@ import bcrypt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
+from dotenv import load_dotenv
+
+# Load env variables
+load_dotenv()
 from app.db.database import get_db
 from app.models import models
 
@@ -13,7 +17,12 @@ from app.models import models
 # We use bcrypt directly to bypass a known incompatibility between passlib and bcrypt >= 4.0.0
 
 # JWT Setup
-SECRET_KEY = os.environ.get("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    import secrets
+    print("[Security Warning] SECRET_KEY environment variable is not set. Generating ephemeral random key.")
+    SECRET_KEY = secrets.token_hex(32)
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 
@@ -71,4 +80,18 @@ def get_optional_current_user(token: Optional[str] = Depends(oauth2_optional_sch
     except Exception:
         pass
     return None
+
+def get_visible_article(article_id: int, db: Session, user: Optional[models.User] = None) -> models.Article:
+    """
+    Safely retrieves an article, enforcing privacy/sensitivity controls.
+    Raises 404 if article doesn't exist OR if it is sensitive and not owned by current user.
+    """
+    article = db.query(models.Article).filter(models.Article.id == article_id).first()
+    if not article:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="المقال غير موجود")
+    if getattr(article, "is_sensitive", False):
+        if not user or article.user_id != user.id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="المقال غير موجود")
+    return article
+
 
