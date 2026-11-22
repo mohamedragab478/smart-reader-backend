@@ -1,3 +1,12 @@
+---
+title: Smart Reader Backend
+emoji: 🐨
+colorFrom: pink
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # Smart Reader Backend
 
 This is the FastAPI backend for the Smart Reader application, designed to be deployed on HuggingFace Spaces.
